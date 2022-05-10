@@ -1,0 +1,160 @@
+当系统频繁调用系统时间函数时，会造成很大的卡顿，尤其是多线程的时候，更严重。
+之前总是认为是localtime_r导致的卡顿，但是经过查看glibc源码之后，发现根源却是另一个函数：mktime。
+这个文章说的挺好：https://wenku.baidu.com/view/d0a1455f158884868762caaedd3383c4bb4cb48e.html
+
+结论：所以需要设置TZ环境变量就能尽可能的缓解（锁优化不了，但是可以优化成纯CPU操作，无IO）
+
+
+具体的源码如下所示:
+mktime
+	time_t
+	mktime (struct tm *tp)
+	{
+	  /* POSIX.1 8.1.1 requires that whenever mktime() is called, the
+	     time zone names contained in the external variable 'tzname' shall
+	     be set as if the tzset() function had been called.  */
+	  __tzset ();
+	# if defined _LIBC || NEED_MKTIME_WORKING
+	  static mktime_offset_t localtime_offset;
+	  return __mktime_internal (tp, __localtime_r, &localtime_offset);
+	# else
+	#  undef mktime
+	  return mktime (tp);
+	# endif
+	}
+	
+	内部调用了__tzset函数		
+		void
+		__tzset (void)
+		{
+		  __libc_lock_lock (tzset_lock);
+		  tzset_internal (1);
+		  if (!__use_tzfile)
+		    {
+		      /* Set `tzname'.  */
+		      __tzname[0] = (char *) tz_rules[0].name;
+		      __tzname[1] = (char *) tz_rules[1].name;
+		    }
+		  __libc_lock_unlock (tzset_lock);
+		}
+		weak_alias (__tzset, tzset)
+	可以看出来__tzset内部调用了tzset_lock锁，其调用了tzset_internal，且传入的参数是1
+
+		/* Interpret the TZ envariable.  */
+		static void
+		tzset_internal (int always)
+		{
+		  static int is_initialized;
+		  const char *tz;
+		  if (is_initialized && !always)
+		    return;
+		  is_initialized = 1;
+		  /* Examine the TZ environment variable.  */
+		  tz = getenv ("TZ");
+		  if (tz && *tz == '\0')
+		    /* User specified the empty string; use UTC explicitly.  */
+		    tz = "Universal";
+		  /* A leading colon means "implementation defined syntax".
+		     We ignore the colon and always use the same algorithm:
+		     try a data file, and if none exists parse the 1003.1 syntax.  */
+		  if (tz && *tz == ':')
+		    ++tz;
+		  /* Check whether the value changed since the last run.  */
+		  if (old_tz != NULL && tz != NULL && strcmp (tz, old_tz) == 0)
+		    /* No change, simply return.  */
+		    return;
+		  if (tz == NULL)
+		    /* No user specification; use the site-wide default.  */
+		    tz = TZDEFAULT;
+		  tz_rules[0].name = NULL;
+		  tz_rules[1].name = NULL;
+		  /* Save the value of `tz'.  */
+		  free (old_tz);
+		  old_tz = tz ? __strdup (tz) : NULL;
+		  /* Try to read a data file.  */
+		  __tzfile_read (tz, 0, NULL);
+		  if (__use_tzfile)
+		    return;
+		  /* No data file found.  Default to UTC if nothing specified.  */
+		  if (tz == NULL || *tz == '\0'
+		      || (TZDEFAULT != NULL && strcmp (tz, TZDEFAULT) == 0))
+		    {
+		      memset (tz_rules, '\0', sizeof tz_rules);
+		      tz_rules[0].name = tz_rules[1].name = "UTC";
+		      if (J0 != 0)
+			tz_rules[0].type = tz_rules[1].type = J0;
+		      tz_rules[0].change = tz_rules[1].change = -1;
+		      update_vars ();
+		      return;
+		    }
+		  __tzset_parse_tz (tz);
+		}
+
+	这个tzset_internal，尤其参数是1，当没有设置环境变量TZ的时候，内部每次__tzfile_read都会进行文件操作，造成IO耗时（不是单纯的CPU运算了）
+
+localtime_r
+	
+	localtime_r内部会调用__tz_convert函数，第二个参数传入的是1
+	/* Return the `struct tm' representation of *T in local time,
+	using *TP to store the result.  */
+	struct tm *
+	__localtime64_r (const __time64_t *t, struct tm *tp)
+	{
+	  return __tz_convert (*t, 1, tp);
+	}
+	/* Provide a 32-bit variant if needed.  */
+	#if __TIMESIZE != 64
+	struct tm *
+	__localtime_r (const time_t *t, struct tm *tp)
+	{
+	  __time64_t t64 = *t;
+	  return __localtime64_r (&t64, tp);
+	}
+	libc_hidden_def (__localtime64_r)
+	#endif
+	weak_alias (__localtime_r, localtime_r)
+
+	
+	可以看出来__tz_convert内部也用了相同的锁tzset_lock（和上面是由竞争关系的）
+	__tz_convert (__time64_t timer, int use_localtime, struct tm *tp)
+	{
+	  long int leap_correction;
+	  int leap_extra_secs;
+	  __libc_lock_lock (tzset_lock);
+	  /* Update internal database according to current TZ setting.
+	     POSIX.1 8.3.7.2 says that localtime_r is not required to set tzname.
+	     This is a good idea since this allows at least a bit more parallelism.  */
+	  tzset_internal (tp == &_tmbuf && use_localtime);
+	  if (__use_tzfile)
+	    __tzfile_compute (timer, use_localtime, &leap_correction,
+			      &leap_extra_secs, tp);
+	  else
+	    {
+	      if (! __offtime (timer, 0, tp))
+		tp = NULL;
+	      else
+		__tz_compute (timer, tp, use_localtime);
+	      leap_correction = 0L;
+	      leap_extra_secs = 0;
+	    }
+	  __libc_lock_unlock (tzset_lock);
+	  if (tp)
+	    {
+	      if (! use_localtime)
+		{
+		  tp->tm_isdst = 0;
+		  tp->tm_zone = "GMT";
+		  tp->tm_gmtoff = 0L;
+		}
+	      if (__offtime (timer, tp->tm_gmtoff - leap_correction, tp))
+		tp->tm_sec += leap_extra_secs;
+	      else
+		tp = NULL;
+	    }
+	  return tp;
+	}
+
+	内部由调用了tzset_internal，但是根据上面第一个函数分析的，这次调用因为传入参数不同，所以tzset_internal内部就不会进行文件操作了（或者说只有第一次才会）
+
+
+
