@@ -1,6 +1,7 @@
 当系统频繁调用系统时间函数时，会造成很大的卡顿，尤其是多线程的时候，更严重。
 之前总是认为是localtime_r导致的卡顿，但是经过查看glibc源码之后，发现根源却是另一个函数：mktime。
-这个文章说的挺好：https://wenku.baidu.com/view/d0a1455f158884868762caaedd3383c4bb4cb48e.html
+这个文章说的挺好，第一次学习到了还有信号安全与不安全函数（怪不得之前signal崩溃时处理不好就有问题停不掉进程）：https://wenku.baidu.com/view/d0a1455f158884868762caaedd3383c4bb4cb48e.html
+
 
 结论：所以需要设置TZ环境变量就能尽可能的缓解（锁优化不了，但是可以优化成纯CPU操作，无IO）
 
